@@ -52,6 +52,7 @@ DEFAULT_N_SAMPLES = 8                    # majority-vote samples per problem
 # 实际截止靠 per-problem 时间预算控制，不靠 token 数
 MAX_NEW_TOKENS = 32768
 MAX_CODE_EXEC_SECONDS = 30               # sandbox timeout per code execution（宽松）
+MAX_SINGLE_SAMPLE_WEIGHT = 1.65          # 1.0 + boxed(0.35) + tool bonus(<=0.30)
 
 # Kaggle Model path (from the Input panel)
 # AWQ 量化版优先（单卡 H100 可用），其次 fallback 到原始版本
@@ -550,14 +551,17 @@ def run_tir_sample(
     problem_text: str,
     deadline: float,
     topic: str = "unknown",
-) -> Optional[int]:
+) -> tuple[Optional[int], float]:
     """
     Single TIR sample — 以时间预算为唯一截止条件，不限轮次。
     上下文工程：
       - 题型识别 → 针对性 strategy hint + few-shot 示例
       - 多轮 TIR：model 生成 → python 沙盒执行 → 结果追回对话
       - 超 context 时自动裁剪旧的 tool output，避免截断崩溃
-    Returns extracted integer answer or None.
+    Returns:
+      (answer, weight)
+      - answer: extracted integer answer or None
+      - weight: confidence-like vote weight for weighted majority voting
     """
     tokenizer = llm.get_tokenizer()
 
@@ -566,6 +570,7 @@ def run_tir_sample(
 
     full_response = ""
     round_idx = 0
+    executed_tool_rounds = 0
 
     while True:
         if time.time() >= deadline:
@@ -596,24 +601,51 @@ def run_tir_sample(
         exec_output = safe_exec(code, timeout=MAX_CODE_EXEC_SECONDS)
         tool_msg = f"```output\n{exec_output}\n```"
         messages.append({"role": "user", "content": tool_msg})
+        executed_tool_rounds += 1
 
         # 已有答案 + 代码执行完毕 → 可以停了
         if has_answer:
             break
 
-    return extract_answer(full_response)
+    answer = extract_answer(full_response)
+    has_boxed = "\\boxed{" in full_response
+    # Weighted vote signal:
+    # - base 1.0
+    # - +0.35 if explicit boxed final answer exists
+    # - +0.10 per tool round, capped at +0.30
+    weight = 1.0
+    if has_boxed:
+        weight += 0.35
+    weight += min(0.30, 0.10 * executed_tool_rounds)
+    return answer, weight
 
 
 # ──────────────────────────────────────────────
 # 5. Majority voting
 # ──────────────────────────────────────────────
 
-def majority_vote(answers: list[Optional[int]]) -> int:
-    valid = [a for a in answers if a is not None]
-    if not valid:
+def majority_vote(sample_results: list[tuple[Optional[int], float]]) -> int:
+    """
+    Weighted majority vote.
+    Tie-break order: higher weighted score -> higher raw count -> smaller answer.
+    """
+    weighted_scores: dict[int, float] = {}
+    raw_counts: Counter[int] = Counter()
+    for ans, w in sample_results:
+        if ans is None:
+            continue
+        raw_counts[ans] += 1
+        weighted_scores[ans] = weighted_scores.get(ans, 0.0) + float(w)
+
+    if not weighted_scores:
         return 0
-    counter = Counter(valid)
-    return counter.most_common(1)[0][0]
+
+    # max by (weighted_score, raw_count, -answer) to keep deterministic tie break
+    best_answer = max(
+        weighted_scores.keys(),
+        key=lambda a: (weighted_scores[a], raw_counts[a], -a),
+    )
+    return int(best_answer)
 
 
 # ──────────────────────────────────────────────
@@ -730,7 +762,9 @@ class Solver:
 
         # 每道题的总截止时间
         problem_deadline = time.time() + self.sample_budget_seconds * self.n_samples
-        answers: list[Optional[int]] = []
+        sample_results: list[tuple[Optional[int], float]] = []
+        weighted_scores: dict[int, float] = {}
+        raw_counts: Counter[int] = Counter()
 
         for i in range(self.n_samples):
             remaining = problem_deadline - time.time()
@@ -740,21 +774,44 @@ class Solver:
             # 动态分配：剩余时间 / 剩余 sample 数，让每个 sample 都有机会跑完
             sample_deadline = time.time() + remaining / (self.n_samples - i)
             try:
-                ans = run_tir_sample(
+                ans, weight = run_tir_sample(
                     self.llm,
                     self._sampling_params,
                     problem_text,
                     deadline=sample_deadline,
                     topic=topic,
                 )
-                answers.append(ans)
-                print(f"[SOLVER] sample {i}: answer={ans}")
+                sample_results.append((ans, weight))
+                if ans is not None:
+                    raw_counts[ans] += 1
+                    weighted_scores[ans] = weighted_scores.get(ans, 0.0) + weight
+                print(f"[SOLVER] sample {i}: answer={ans}, weight={weight:.2f}")
+
+                # Early stop 1: strict raw majority already achieved
+                if ans is not None and raw_counts[ans] > self.n_samples // 2:
+                    print(f"[SOLVER] early-stop: raw majority reached by answer={ans}")
+                    break
+
+                # Early stop 2: weighted lead cannot be overtaken
+                remaining_samples = self.n_samples - (i + 1)
+                if weighted_scores and remaining_samples > 0:
+                    ranked = sorted(weighted_scores.items(), key=lambda x: x[1], reverse=True)
+                    best_ans, best_score = ranked[0]
+                    second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+                    max_second_possible = second_score + remaining_samples * MAX_SINGLE_SAMPLE_WEIGHT
+                    if best_score > max_second_possible:
+                        print(
+                            "[SOLVER] early-stop: weighted winner locked "
+                            f"(best={best_ans}, score={best_score:.2f}, "
+                            f"max_second={max_second_possible:.2f})"
+                        )
+                        break
             except Exception as e:
                 print(f"[WARN] Sample {i} failed: {e}")
-                answers.append(None)
+                sample_results.append((None, 0.0))
 
-        result = majority_vote(answers)
-        print(f"[SOLVER] final vote: {answers} → {result}")
+        result = majority_vote(sample_results)
+        print(f"[SOLVER] final vote: {sample_results} → {result}")
         return result
 
 
