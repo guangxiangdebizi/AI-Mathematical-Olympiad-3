@@ -222,6 +222,67 @@ def _sync_submission_outputs(comp_root: Optional[str]) -> None:
         )
 
 
+def _force_write_kaggle_working() -> None:
+    """
+    最终兜底：无论之前发生了什么，确保 /kaggle/working/ 下
+    同时存在 submission.csv 和 submission.parquet。
+    搜索顺序：/kaggle/working → 当前目录 → 任意路径 glob。
+    """
+    KAGGLE_WORKING = "/kaggle/working"
+    csv_dst = os.path.join(KAGGLE_WORKING, "submission.csv")
+    pq_dst  = os.path.join(KAGGLE_WORKING, "submission.parquet")
+
+    # 候选文件：先找已有的
+    candidates_csv = [
+        csv_dst,
+        "submission.csv",
+        *glob.glob("/kaggle/**/submission.csv", recursive=True),
+    ]
+    candidates_pq = [
+        pq_dst,
+        "submission.parquet",
+        *glob.glob("/kaggle/**/submission.parquet", recursive=True),
+    ]
+
+    df: Optional[pl.DataFrame] = None
+
+    # 优先从 parquet 读（更完整）
+    for p in candidates_pq:
+        if os.path.exists(p):
+            try:
+                df = pl.read_parquet(p)
+                print(f"[FORCE-WRITE] source parquet: {p}")
+                break
+            except Exception:
+                pass
+
+    # 再从 csv 读
+    if df is None:
+        for p in candidates_csv:
+            if os.path.exists(p):
+                try:
+                    df = pl.read_csv(p)
+                    print(f"[FORCE-WRITE] source csv: {p}")
+                    break
+                except Exception:
+                    pass
+
+    if df is None:
+        print("[FORCE-WRITE] WARN: no submission source found — nothing to write.")
+        return
+
+    # 写到 /kaggle/working/
+    try:
+        os.makedirs(KAGGLE_WORKING, exist_ok=True)
+        df.write_csv(csv_dst)
+        df.write_parquet(pq_dst)
+        print(f"[FORCE-WRITE] written: {csv_dst}  ({len(df)} rows)")
+        print(f"[FORCE-WRITE] written: {pq_dst}")
+        print(f"[FORCE-WRITE] /kaggle/working/ contents: {os.listdir(KAGGLE_WORKING)}")
+    except Exception as e:
+        print(f"[FORCE-WRITE] ERROR: {e}")
+
+
 # ──────────────────────────────────────────────
 # 1. Context Engineering
 # ──────────────────────────────────────────────
@@ -1160,64 +1221,60 @@ def main() -> None:
     predict = make_predict(solver)
     inference_server = AIMO3InferenceServer(predict)
 
+    run_ok = True
     if os.getenv("KAGGLE_IS_COMPETITION_RERUN"):
         # Official rerun: serve() blocks until all predictions done
-        inference_server.serve()
-        return
-
-    # ── local / public debug ──
-    test_path = resolve_test_path(args.test_path, comp_root)
-    print(f"[INFO] test path : {test_path}")
-    run_ok = True
-    try:
-        inference_server.run_local_gateway(data_paths=(test_path,))
-    except Exception as e:
-        run_ok = False
-        print(f"[WARN] run_local_gateway failed: {e}")
-        traceback.print_exc()
+        try:
+            inference_server.serve()
+        except Exception as e:
+            run_ok = False
+            print(f"[WARN] serve() failed: {e}")
+            traceback.print_exc()
+    else:
+        # ── local / public debug ──
+        test_path = resolve_test_path(args.test_path, comp_root)
+        print(f"[INFO] test path : {test_path}")
+        try:
+            inference_server.run_local_gateway(data_paths=(test_path,))
+        except Exception as e:
+            run_ok = False
+            print(f"[WARN] run_local_gateway failed: {e}")
+            traceback.print_exc()
 
     # Always ensure both csv/parquet outputs exist for Kaggle submit dialog.
+    # This runs in BOTH local and competition-rerun modes.
     _sync_submission_outputs(comp_root)
 
-    if os.path.exists("submission.parquet"):
-        sub = pl.read_parquet("submission.parquet")
+    # Final hard-write: guarantee /kaggle/working/submission.csv always exists.
+    _force_write_kaggle_working()
+
+    if os.path.exists("/kaggle/working/submission.csv"):
+        sub = pl.read_csv("/kaggle/working/submission.csv")
         print(sub)
         print("[INFO] submission artifacts ready.")
+    elif os.path.exists("submission.parquet"):
+        sub = pl.read_parquet("submission.parquet")
+        print(sub)
+        print("[INFO] submission artifacts ready (local only).")
     else:
-        print("[WARN] submission.parquet still not found after sync.")
+        print("[WARN] submission artifacts still not found after sync.")
 
     if not run_ok:
         print("[WARN] main run had errors; fallback submission artifacts were generated.")
 
 
 def _ensure_vllm() -> None:
-    """Auto-install vLLM and enforce protobuf compatibility."""
-    import subprocess
+    """Check vLLM availability. No network install — internet must be OFF for competition submit."""
     try:
         import vllm  # noqa
+        print("[INFO] vLLM is available.")
     except ImportError:
-        print("[INFO] vLLM not found, installing... (takes ~2 min)")
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "vllm", "-q"],
-            check=True,
+        raise ImportError(
+            "vLLM is not installed in this environment.\n"
+            "In Kaggle notebook: add the 'vllm' package via Settings → Add-ons, "
+            "or attach a pre-built vLLM wheel dataset.\n"
+            "Do NOT enable internet access — it will block submission."
         )
-        print("[INFO] vLLM installed successfully.")
-    # Kaggle evaluation's grpc stubs are incompatible with protobuf 6.x.
-    # Pin protobuf to 5.x to avoid:
-    # AttributeError: 'MessageFactory' object has no attribute 'GetPrototype'
-    try:
-        import google.protobuf  # noqa
-        from google.protobuf import __version__ as pb_ver
-        major = int(pb_ver.split(".")[0])
-    except Exception:
-        major = 0
-    if major >= 6:
-        print(f"[INFO] protobuf {major}.x detected, downgrading to 5.x for kaggle_evaluation compatibility...")
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "protobuf>=5.26.1,<6", "-q"],
-            check=True,
-        )
-        print("[INFO] protobuf downgraded to 5.x.")
 
 
 def _patch_protobuf_compat() -> None:
