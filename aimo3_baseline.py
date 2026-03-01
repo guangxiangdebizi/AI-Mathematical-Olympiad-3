@@ -55,12 +55,16 @@ MAX_CODE_EXEC_SECONDS = 30               # sandbox timeout per code execution（
 
 # Kaggle Model path (from the Input panel)
 # AWQ 量化版优先（单卡 H100 可用），其次 fallback 到原始版本
+# Kaggle 实际挂载路径格式：/kaggle/input/models/<owner>/<model>/...
 MODEL_SEARCH_ROOTS = [
+    "/kaggle/input/models/shelterw/qwen2.5-math/transformers/qwen2.5-math-72b-instruct-awq/V1",
+    "/kaggle/input/models/shelterw/qwen2.5-math/transformers/qwen2.5-math-72b-instruct-awq/1",
     "/kaggle/input/shelterw/qwen2.5-math/transformers/qwen2.5-math-72b-instruct-awq/V1",
     "/kaggle/input/shelterw/qwen2.5-math/transformers/qwen2.5-math-72b-instruct-awq/1",
     "/kaggle/input/qwen-lm/qwen2.5-math/transformers/72b/V1",
     "/kaggle/input/qwen-lm/qwen2.5-math/transformers/72b/1",
-    "/kaggle/input",
+    "/kaggle/input/models/qwen-lm/qwen2.5-math/transformers/72b/V1",
+    "/kaggle/input/models/qwen-lm/qwen2.5-math/transformers/72b/1",
 ]
 
 
@@ -98,25 +102,27 @@ def import_inference_server(eval_dir: str, comp_root: str):
 
 
 def find_model_path() -> str:
-    """Locate Qwen2.5-Math-72B weights directory."""
+    """Locate model weights dir — AWQ quantized version preferred."""
+    # 1) Check explicit roots first (AWQ listed before non-quantized)
     for root in MODEL_SEARCH_ROOTS:
-        for version_dir in ["V1", "1", ""]:
-            candidate = os.path.join(root, version_dir) if version_dir else root
-            if os.path.isdir(candidate):
-                config = os.path.join(candidate, "config.json")
-                if os.path.exists(config):
-                    print(f"[INFO] model found at: {candidate}")
-                    return candidate
-    # fallback: glob
-    hits = glob.glob("/kaggle/input/**/config.json", recursive=True)
-    hits = [h for h in hits if "qwen" in h.lower() or "math" in h.lower()]
-    if hits:
-        p = str(Path(hits[0]).parent)
-        print(f"[INFO] model found (glob fallback) at: {p}")
-        return p
+        if os.path.isdir(root) and os.path.exists(os.path.join(root, "config.json")):
+            print(f"[INFO] model found at: {root}")
+            return root
+
+    # 2) Glob fallback: prefer AWQ/GPTQ quantized models
+    all_hits = glob.glob("/kaggle/input/**/config.json", recursive=True)
+    awq_hits = [h for h in all_hits if "awq" in h.lower() or "gptq" in h.lower()]
+    math_hits = [h for h in all_hits if "qwen" in h.lower() and "math" in h.lower()]
+
+    for hits in [awq_hits, math_hits]:
+        if hits:
+            p = str(Path(hits[0]).parent)
+            print(f"[INFO] model found (glob fallback) at: {p}")
+            return p
+
     raise FileNotFoundError(
         "Cannot locate Qwen2.5-Math model weights.\n"
-        "In Kaggle notebook: Add Input → Models → search 'qwen2.5-math' → add 72B."
+        "In Kaggle notebook: Add Input → Models → search 'qwen2.5-math-72b-instruct-awq'."
     )
 
 
@@ -679,13 +685,21 @@ class Solver:
 
         print(f"[INFO] tensor_parallel_size: {tp}, quantized: {is_quantized}")
 
-        # max_model_len：量化模型显存充裕可以开更长
-        max_ctx = 8192 if is_quantized else 4096
+        # max_model_len: never exceed model config limit.
+        # For this AWQ model, max_position_embeddings is 4096.
+        cfg_max_ctx = cfg.get("max_position_embeddings") if os.path.exists(config_path) else None
+        if isinstance(cfg_max_ctx, int) and cfg_max_ctx > 0:
+            max_ctx = cfg_max_ctx
+        else:
+            max_ctx = 4096
+
+        # AWQ/GPTQ quantized models on vLLM require float16 dtype.
+        dtype_for_model = "float16" if is_quantized else "auto"
 
         load_kwargs = dict(
             model=self.model_path,
             tensor_parallel_size=tp,
-            dtype="auto",            # 量化模型用 auto，自动识别精度
+            dtype=dtype_for_model,
             trust_remote_code=True,
             max_model_len=max_ctx,
             gpu_memory_utilization=0.92,
@@ -835,21 +849,61 @@ def main() -> None:
 
 
 def _ensure_vllm() -> None:
-    """Auto-install vLLM if missing (for Kaggle notebook direct run)."""
+    """Auto-install vLLM and enforce protobuf compatibility."""
+    import subprocess
     try:
         import vllm  # noqa
     except ImportError:
         print("[INFO] vLLM not found, installing... (takes ~2 min)")
-        import subprocess
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "vllm", "-q"],
             check=True,
         )
         print("[INFO] vLLM installed successfully.")
+    # Kaggle evaluation's grpc stubs are incompatible with protobuf 6.x.
+    # Pin protobuf to 5.x to avoid:
+    # AttributeError: 'MessageFactory' object has no attribute 'GetPrototype'
+    try:
+        import google.protobuf  # noqa
+        from google.protobuf import __version__ as pb_ver
+        major = int(pb_ver.split(".")[0])
+    except Exception:
+        major = 0
+    if major >= 6:
+        print(f"[INFO] protobuf {major}.x detected, downgrading to 5.x for kaggle_evaluation compatibility...")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "protobuf>=5.26.1,<6", "-q"],
+            check=True,
+        )
+        print("[INFO] protobuf downgraded to 5.x.")
+
+
+def _patch_protobuf_compat() -> None:
+    """
+    vLLM 安装会把 protobuf 升级到 6.x，导致 kaggle_evaluation 的 grpc 生成代码
+    调用 MessageFactory.GetPrototype 时报 AttributeError（该方法在 4.x+ 被移除）。
+    这里打一个向后兼容的 monkey patch，用新 API GetMessageClass 代替。
+    必须在 import kaggle_evaluation 之前调用。
+    """
+    try:
+        import google.protobuf.message_factory as _mf
+        import google.protobuf.symbol_database as _sdb
+        if not hasattr(_mf.MessageFactory, "GetPrototype"):
+            def _get_prototype(self, descriptor):
+                return _mf.GetMessageClass(descriptor)
+            _mf.MessageFactory.GetPrototype = _get_prototype
+        if not hasattr(_sdb.SymbolDatabase, "GetPrototype"):
+            def _symdb_get_prototype(self, descriptor):
+                return _mf.GetMessageClass(descriptor)
+            _sdb.SymbolDatabase.GetPrototype = _symdb_get_prototype
+        print("[INFO] protobuf compat patch applied (GetPrototype → GetMessageClass)")
+    except Exception as e:
+        print(f"[WARN] protobuf patch failed (may be OK): {e}")
 
 
 # ── Auto-run: works both as notebook cell and as CLI script ──
 # When pasted into a Kaggle notebook cell and Run All is clicked,
 # __name__ is NOT "__main__", so we call main() unconditionally here.
 _ensure_vllm()
+_patch_protobuf_compat()
 main()
