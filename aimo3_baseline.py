@@ -857,6 +857,7 @@ class Solver:
         self.llm = None
         self.model_path = model_path
         self.max_model_len = 4096
+        self._model_ready = False
         # 每题时间预算 = (总时间 - 启动预留) / 题目数，再除以采样数
         # 即每个 sample 独立分到一份时间，各自有独立 deadline
         self.sample_budget_seconds = (
@@ -938,7 +939,19 @@ class Solver:
             load_kwargs["quantization"] = "gptq"
 
         self.llm = LLM(**load_kwargs)
+        self._model_ready = True
         print("[INFO] Model loaded successfully.")
+
+    def ensure_model_loaded(self) -> None:
+        """Lazy-load model on first predict call to avoid server startup timeout."""
+        if self.dry_run:
+            return
+        if self._model_ready and self.llm is not None:
+            return
+        t0 = time.time()
+        print("[INFO] Lazy loading model on first predict...")
+        self.load_model()
+        print(f"[INFO] Lazy load done in {time.time() - t0:.1f}s")
 
     def _sampling_params(self):
         from vllm import SamplingParams  # noqa: lazy import
@@ -949,8 +962,10 @@ class Solver:
         )
 
     def solve(self, problem_text: str) -> int:
-        if self.dry_run or self.llm is None:
+        if self.dry_run:
             return 0
+        if self.llm is None:
+            self.ensure_model_loaded()
 
         topic = classify_problem(problem_text)
         print(f"[SOLVER] detected topic: {topic}")
@@ -1053,13 +1068,12 @@ def main() -> None:
     # ── locate model ──
     model_path = "" if args.dry_run else find_model_path()
 
-    # ── build solver & load model ──
+    # ── build solver (lazy model load on first predict) ──
     solver = Solver(
         model_path=model_path,
         n_samples=args.n_samples,
         dry_run=args.dry_run,
     )
-    solver.load_model()
 
     # ── register predict and start server ──
     predict = make_predict(solver)
