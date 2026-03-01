@@ -141,6 +141,87 @@ def resolve_test_path(explicit: Optional[str], comp_root: Optional[str]) -> str:
     raise FileNotFoundError("Cannot find test.csv.")
 
 
+def _unique_paths(paths: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for p in paths:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def _sync_submission_outputs(comp_root: Optional[str]) -> None:
+    """
+    Ensure both submission.csv and submission.parquet exist in /kaggle/working
+    and current working directory.
+    """
+    output_dirs = _unique_paths([os.getcwd(), "/kaggle/working"])
+
+    def _first_existing(cands: list[str]) -> Optional[str]:
+        for c in cands:
+            if os.path.exists(c):
+                return c
+        return None
+
+    csv_candidates = [os.path.join(d, "submission.csv") for d in output_dirs]
+    pq_candidates = [os.path.join(d, "submission.parquet") for d in output_dirs]
+
+    csv_src = _first_existing(csv_candidates)
+    pq_src = _first_existing(pq_candidates)
+
+    # If neither exists, create a fallback from sample_submission.csv
+    if csv_src is None and pq_src is None and comp_root:
+        sample_path = os.path.join(comp_root, "sample_submission.csv")
+        if os.path.exists(sample_path):
+            print("[WARN] No submission artifacts found; creating fallback from sample_submission.csv")
+            df = pl.read_csv(sample_path)
+            csv_src = os.path.join(output_dirs[0], "submission.csv")
+            pq_src = os.path.join(output_dirs[0], "submission.parquet")
+            df.write_csv(csv_src)
+            df.write_parquet(pq_src)
+
+    # Build missing counterpart from whichever exists
+    if csv_src is None and pq_src is not None:
+        try:
+            tmp_csv = os.path.join(output_dirs[0], "submission.csv")
+            pl.read_parquet(pq_src).write_csv(tmp_csv)
+            csv_src = tmp_csv
+            print(f"[INFO] created csv from parquet: {tmp_csv}")
+        except Exception as e:
+            print(f"[WARN] failed to create csv from parquet: {e}")
+    if pq_src is None and csv_src is not None:
+        try:
+            tmp_pq = os.path.join(output_dirs[0], "submission.parquet")
+            pl.read_csv(csv_src).write_parquet(tmp_pq)
+            pq_src = tmp_pq
+            print(f"[INFO] created parquet from csv: {tmp_pq}")
+        except Exception as e:
+            print(f"[WARN] failed to create parquet from csv: {e}")
+
+    # Sync both files into all output directories
+    if csv_src is not None:
+        csv_df = pl.read_csv(csv_src)
+        for d in output_dirs:
+            dst = os.path.join(d, "submission.csv")
+            csv_df.write_csv(dst)
+    if pq_src is not None:
+        pq_df = pl.read_parquet(pq_src)
+        for d in output_dirs:
+            dst = os.path.join(d, "submission.parquet")
+            pq_df.write_parquet(dst)
+
+    # Final status print
+    for d in output_dirs:
+        csv_p = os.path.join(d, "submission.csv")
+        pq_p = os.path.join(d, "submission.parquet")
+        print(
+            f"[INFO] output check @ {d}: "
+            f"csv={'Y' if os.path.exists(csv_p) else 'N'}, "
+            f"parquet={'Y' if os.path.exists(pq_p) else 'N'}"
+        )
+
+
 # ──────────────────────────────────────────────
 # 1. Context Engineering
 # ──────────────────────────────────────────────
@@ -1087,15 +1168,26 @@ def main() -> None:
     # ── local / public debug ──
     test_path = resolve_test_path(args.test_path, comp_root)
     print(f"[INFO] test path : {test_path}")
-    inference_server.run_local_gateway(data_paths=(test_path,))
+    run_ok = True
+    try:
+        inference_server.run_local_gateway(data_paths=(test_path,))
+    except Exception as e:
+        run_ok = False
+        print(f"[WARN] run_local_gateway failed: {e}")
+        traceback.print_exc()
+
+    # Always ensure both csv/parquet outputs exist for Kaggle submit dialog.
+    _sync_submission_outputs(comp_root)
 
     if os.path.exists("submission.parquet"):
         sub = pl.read_parquet("submission.parquet")
         print(sub)
-        sub.write_csv("submission.csv")
-        print("[INFO] saved submission.csv")
+        print("[INFO] submission artifacts ready.")
     else:
-        print("[WARN] submission.parquet not found")
+        print("[WARN] submission.parquet still not found after sync.")
+
+    if not run_ok:
+        print("[WARN] main run had errors; fallback submission artifacts were generated.")
 
 
 def _ensure_vllm() -> None:
