@@ -52,7 +52,8 @@ DEFAULT_N_SAMPLES = 8                    # majority-vote samples per problem
 # 实际截止靠 per-problem 时间预算控制，不靠 token 数
 MAX_NEW_TOKENS = 32768
 MAX_CODE_EXEC_SECONDS = 30               # sandbox timeout per code execution（宽松）
-MAX_SINGLE_SAMPLE_WEIGHT = 1.65          # 1.0 + boxed(0.35) + tool bonus(<=0.30)
+MAX_SINGLE_SAMPLE_WEIGHT = 1.5           # normalized vote weight upper bound
+TRIM_CONTEXT_RATIO = 0.82                # keep prompt under this ratio of max_model_len
 
 # Kaggle Model path (from the Input panel)
 # AWQ 量化版优先（单卡 H100 可用），其次 fallback 到原始版本
@@ -186,15 +187,74 @@ _TOPIC_KEYWORDS: dict[str, list[str]] = {
     ],
 }
 
+_TOPIC_KEYWORD_WEIGHTS: dict[str, dict[str, float]] = {
+    "number_theory": {
+        "prime": 2.0,
+        "modulo": 2.0,
+        "divisible": 1.8,
+        "gcd": 1.8,
+        "lcm": 1.8,
+        "congruent": 1.8,
+        "totient": 2.2,
+    },
+    "geometry": {
+        "triangle": 1.6,
+        "circle": 1.8,
+        "circumcircle": 2.0,
+        "incircle": 2.0,
+        "concyclic": 2.2,
+    },
+    "combinatorics": {
+        "permutation": 1.8,
+        "combination": 1.8,
+        "graph": 1.8,
+        "coloring": 1.8,
+        "probability": 2.0,
+    },
+    "algebra": {
+        "polynomial": 1.8,
+        "inequality": 1.8,
+        "functional equation": 2.2,
+        "matrix": 1.8,
+        "determinant": 1.8,
+    },
+}
+
+_TOPIC_REGEX_FLAGS = re.IGNORECASE
+
+
+def _keyword_to_pattern(keyword: str) -> re.Pattern:
+    """Convert a keyword to a boundary-aware regex pattern."""
+    escaped = re.escape(keyword.lower())
+    if keyword.startswith("\\"):
+        # LaTeX tokens like \angle, \binom should be matched literally.
+        return re.compile(escaped, _TOPIC_REGEX_FLAGS)
+    if re.fullmatch(r"[a-zA-Z0-9_]+", keyword):
+        # Word boundary blocks false positives like prime vs primitive.
+        return re.compile(rf"\b{escaped}(?:s|es)?\b", _TOPIC_REGEX_FLAGS)
+    return re.compile(escaped, _TOPIC_REGEX_FLAGS)
+
+
+_TOPIC_PATTERNS: dict[str, list[tuple[re.Pattern, float]]] = {
+    topic: [
+        (
+            _keyword_to_pattern(kw),
+            _TOPIC_KEYWORD_WEIGHTS.get(topic, {}).get(kw, 1.0),
+        )
+        for kw in kws
+    ]
+    for topic, kws in _TOPIC_KEYWORDS.items()
+}
+
 
 def classify_problem(problem_text: str) -> str:
     """Return one of: geometry | number_theory | combinatorics | algebra | unknown."""
     text_lower = problem_text.lower()
-    scores: dict[str, int] = {t: 0 for t in _TOPIC_KEYWORDS}
-    for topic, kws in _TOPIC_KEYWORDS.items():
-        for kw in kws:
-            if kw.lower() in text_lower:
-                scores[topic] += 1
+    scores: dict[str, float] = {t: 0.0 for t in _TOPIC_PATTERNS}
+    for topic, pats in _TOPIC_PATTERNS.items():
+        for pat, weight in pats:
+            if pat.search(text_lower):
+                scores[topic] += weight
     best = max(scores, key=lambda t: scores[t])
     return best if scores[best] > 0 else "unknown"
 
@@ -424,7 +484,7 @@ def build_messages(problem_text: str, topic: str) -> list[dict]:
 def _trim_messages_to_fit(
     messages: list[dict],
     tokenizer,
-    max_context_tokens: int = 3000,
+    max_context_tokens: int,
 ) -> list[dict]:
     """
     If the rendered prompt exceeds max_context_tokens, progressively remove
@@ -459,6 +519,19 @@ def _trim_messages_to_fit(
 def _exec_worker(code: str, result_queue: multiprocessing.Queue) -> None:
     """Run in a separate process to isolate crashes and enforce timeout."""
     buf = io.StringIO()
+    allowed_import_roots = {
+        "math", "sympy", "itertools", "fractions", "collections",
+        "functools", "statistics", "decimal",
+    }
+
+    def _safe_import(name, globals_=None, locals_=None, fromlist=(), level=0):
+        if level != 0:
+            raise ImportError("Relative imports are not allowed in sandbox.")
+        root = name.split(".")[0]
+        if root not in allowed_import_roots:
+            raise ImportError(f"Import '{name}' is not allowed in sandbox.")
+        return __import__(name, globals_, locals_, fromlist, level)
+
     allowed_globals = {
         "__builtins__": {
             "print": print,
@@ -468,7 +541,7 @@ def _exec_worker(code: str, result_queue: multiprocessing.Queue) -> None:
             "enumerate": enumerate, "zip": zip, "map": map, "filter": filter,
             "round": round, "divmod": divmod, "pow": pow, "hex": hex,
             "bin": bin, "oct": oct, "bool": bool, "type": type,
-            "__import__": __import__,
+            "__import__": _safe_import,
         }
     }
     try:
@@ -499,46 +572,154 @@ def safe_exec(code: str, timeout: float = MAX_CODE_EXEC_SECONDS) -> str:
 # 3. Answer extraction
 # ──────────────────────────────────────────────
 
+SIGNED_INT_RE = r"[-+]?\d[\d,]*"
+
+
+def _int_from_raw(raw: str) -> Optional[int]:
+    cleaned = raw.strip().replace(",", "")
+    if not re.fullmatch(r"[-+]?\d+", cleaned):
+        return None
+    try:
+        return int(cleaned)
+    except ValueError:
+        return None
+
+
+def _safe_eval_int_expr(expr: str) -> Optional[int]:
+    """Safely evaluate simple integer arithmetic for boxed expressions."""
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
+        return None
+
+    def _eval(node):
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, int):
+            return node.value
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            val = _eval(node.operand)
+            return val if isinstance(node.op, ast.UAdd) else -val
+        if isinstance(node, ast.BinOp) and isinstance(
+            node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod, ast.Pow)
+        ):
+            left = _eval(node.left)
+            right = _eval(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.FloorDiv):
+                return left // right
+            if isinstance(node.op, ast.Mod):
+                return left % right
+            return left ** right
+        raise ValueError("unsupported expression")
+
+    try:
+        return int(_eval(tree))
+    except Exception:
+        return None
+
+
+def _extract_conclusion_numbers(text: str) -> list[int]:
+    markers = ("final", "therefore", "thus", "hence", "answer", "so")
+    out: list[int] = []
+    for line in text.splitlines():
+        if not re.search(r"\b(final|therefore|thus|hence|answer|so)\b", line, re.IGNORECASE):
+            continue
+        for m in re.finditer(SIGNED_INT_RE, line):
+            parsed = _int_from_raw(m.group(0))
+            if parsed is not None:
+                out.append(parsed)
+    # Also catch compact forms like "Therefore, x = -12345" near the end.
+    for m in re.finditer(
+        rf"(?:final answer|therefore|thus|hence|answer)\D{{0,20}}({SIGNED_INT_RE})",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        parsed = _int_from_raw(m.group(1))
+        if parsed is not None:
+            out.append(parsed)
+    return out
+
+
+def _extract_last_integer(text: str) -> Optional[int]:
+    matches = list(re.finditer(SIGNED_INT_RE, text))
+    for m in reversed(matches):
+        parsed = _int_from_raw(m.group(0))
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def extract_answer(text: str) -> Optional[int]:
     """
     Parse final integer answer from model output.
-    Priority: \\boxed{N} → last bare integer → None
+    Priority: \\boxed{N} → final/therefore neighborhood → last integer.
     """
     # 1) \boxed{...}
     boxed_matches = re.findall(r"\\boxed\{([^}]+)\}", text)
     for raw in reversed(boxed_matches):
-        raw = raw.strip().replace(",", "")
-        # Handle expressions like \boxed{336}
-        try:
-            val = int(raw)
-            return val % MOD
-        except ValueError:
-            # Try to eval simple expressions like 3*5+2
-            try:
-                val = int(eval(raw, {"__builtins__": {}}, {}))  # nosec
-                return val % MOD
-            except Exception:
-                pass
+        parsed = _int_from_raw(raw)
+        if parsed is not None:
+            return parsed % MOD
+        expr_val = _safe_eval_int_expr(raw.strip())
+        if expr_val is not None:
+            return expr_val % MOD
 
-    # 2) Last integer on a line starting with "Answer:" or "= N"
-    for pat in [
-        r"[Aa]nswer[:\s]+(-?\d+)",
-        r"=\s*(-?\d+)\s*$",
-        r"(?:therefore|thus|so)[,\s]+.*?(-?\d+)\s*$",
-    ]:
-        m = re.search(pat, text, re.MULTILINE)
-        if m:
-            try:
-                return int(m.group(1)) % MOD
-            except ValueError:
-                pass
+    # 2) Integers around conclusion markers
+    conclusion_numbers = _extract_conclusion_numbers(text)
+    if conclusion_numbers:
+        return conclusion_numbers[-1] % MOD
 
-    # 3) Last standalone integer in the text
-    ints = re.findall(r"\b(\d{1,6})\b", text)
-    if ints:
-        return int(ints[-1]) % MOD
-
+    # 3) Last standalone integer in text (long integers and signs supported)
+    last_int = _extract_last_integer(text)
+    if last_int is not None:
+        return last_int % MOD
     return None
+
+
+def _compute_evidence_score(
+    full_response: str,
+    answer_mod: Optional[int],
+    last_exec_output: Optional[str],
+) -> float:
+    """Score one sample by evidence consistency rather than format only."""
+    if answer_mod is None:
+        return 0.0
+
+    has_boxed = "\\boxed{" in full_response
+    conclusion_numbers_mod = [x % MOD for x in _extract_conclusion_numbers(full_response)]
+    in_conclusion = answer_mod in conclusion_numbers_mod
+    all_numbers_mod = [
+        x % MOD for x in (
+            _int_from_raw(m.group(0))
+            for m in re.finditer(SIGNED_INT_RE, full_response)
+        )
+        if x is not None
+    ]
+    repeated_mentions = all_numbers_mod.count(answer_mod)
+    repeated_consistent = repeated_mentions >= 2
+
+    supported_by_last_tool = False
+    if last_exec_output:
+        tool_last_int = _extract_last_integer(last_exec_output)
+        if tool_last_int is not None:
+            supported_by_last_tool = (tool_last_int % MOD) == answer_mod
+
+    score = 0.35
+    if has_boxed:
+        score += 0.10
+    if in_conclusion:
+        score += 0.35
+    if repeated_consistent:
+        score += 0.25
+    if supported_by_last_tool:
+        score += 0.55
+    return min(1.60, score)
 
 
 # ──────────────────────────────────────────────
@@ -551,6 +732,7 @@ def run_tir_sample(
     problem_text: str,
     deadline: float,
     topic: str = "unknown",
+    max_model_len: int = 4096,
 ) -> tuple[Optional[int], float]:
     """
     Single TIR sample — 以时间预算为唯一截止条件，不限轮次。
@@ -571,6 +753,8 @@ def run_tir_sample(
     full_response = ""
     round_idx = 0
     executed_tool_rounds = 0
+    last_exec_output: Optional[str] = None
+    trim_target = max(1024, int(max_model_len * TRIM_CONTEXT_RATIO))
 
     while True:
         if time.time() >= deadline:
@@ -578,7 +762,7 @@ def run_tir_sample(
             break
 
         # 超长保护：裁剪旧的 tool output，避免超出 max_model_len
-        messages = _trim_messages_to_fit(messages, tokenizer, max_context_tokens=3500)
+        messages = _trim_messages_to_fit(messages, tokenizer, max_context_tokens=trim_target)
 
         prompt = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
@@ -599,6 +783,7 @@ def run_tir_sample(
         # 执行最后一个代码块并把结果反馈回去
         code = code_blocks[-1].strip()
         exec_output = safe_exec(code, timeout=MAX_CODE_EXEC_SECONDS)
+        last_exec_output = exec_output
         tool_msg = f"```output\n{exec_output}\n```"
         messages.append({"role": "user", "content": tool_msg})
         executed_tool_rounds += 1
@@ -608,16 +793,10 @@ def run_tir_sample(
             break
 
     answer = extract_answer(full_response)
-    has_boxed = "\\boxed{" in full_response
-    # Weighted vote signal:
-    # - base 1.0
-    # - +0.35 if explicit boxed final answer exists
-    # - +0.10 per tool round, capped at +0.30
-    weight = 1.0
-    if has_boxed:
-        weight += 0.35
-    weight += min(0.30, 0.10 * executed_tool_rounds)
-    return answer, weight
+    evidence_score = _compute_evidence_score(full_response, answer, last_exec_output)
+    # Keep a tiny process quality signal, avoid round-count dominating correctness.
+    evidence_score += min(0.03, 0.01 * executed_tool_rounds)
+    return answer, evidence_score
 
 
 # ──────────────────────────────────────────────
@@ -626,16 +805,30 @@ def run_tir_sample(
 
 def majority_vote(sample_results: list[tuple[Optional[int], float]]) -> int:
     """
-    Weighted majority vote.
+    Weighted majority vote with per-problem weight normalization.
     Tie-break order: higher weighted score -> higher raw count -> smaller answer.
     """
+    valid_scores = [w for ans, w in sample_results if ans is not None]
+    if not valid_scores:
+        return 0
+
+    min_w = min(valid_scores)
+    max_w = max(valid_scores)
+
+    def _normalize(weight: float) -> float:
+        if max_w == min_w:
+            return 1.0
+        # Normalize to [0.5, 1.5] before voting.
+        return 0.5 + (weight - min_w) / (max_w - min_w)
+
     weighted_scores: dict[int, float] = {}
     raw_counts: Counter[int] = Counter()
     for ans, w in sample_results:
         if ans is None:
             continue
+        nw = _normalize(float(w))
         raw_counts[ans] += 1
-        weighted_scores[ans] = weighted_scores.get(ans, 0.0) + float(w)
+        weighted_scores[ans] = weighted_scores.get(ans, 0.0) + nw
 
     if not weighted_scores:
         return 0
@@ -663,6 +856,7 @@ class Solver:
         self.dry_run = dry_run
         self.llm = None
         self.model_path = model_path
+        self.max_model_len = 4096
         # 每题时间预算 = (总时间 - 启动预留) / 题目数，再除以采样数
         # 即每个 sample 独立分到一份时间，各自有独立 deadline
         self.sample_budget_seconds = (
@@ -724,6 +918,7 @@ class Solver:
             max_ctx = cfg_max_ctx
         else:
             max_ctx = 4096
+        self.max_model_len = max_ctx
 
         # AWQ/GPTQ quantized models on vLLM require float16 dtype.
         dtype_for_model = "float16" if is_quantized else "auto"
@@ -763,7 +958,6 @@ class Solver:
         # 每道题的总截止时间
         problem_deadline = time.time() + self.sample_budget_seconds * self.n_samples
         sample_results: list[tuple[Optional[int], float]] = []
-        weighted_scores: dict[int, float] = {}
         raw_counts: Counter[int] = Counter()
 
         for i in range(self.n_samples):
@@ -780,32 +974,17 @@ class Solver:
                     problem_text,
                     deadline=sample_deadline,
                     topic=topic,
+                    max_model_len=self.max_model_len,
                 )
                 sample_results.append((ans, weight))
                 if ans is not None:
                     raw_counts[ans] += 1
-                    weighted_scores[ans] = weighted_scores.get(ans, 0.0) + weight
-                print(f"[SOLVER] sample {i}: answer={ans}, weight={weight:.2f}")
+                print(f"[SOLVER] sample {i}: answer={ans}, evidence={weight:.2f}")
 
                 # Early stop 1: strict raw majority already achieved
                 if ans is not None and raw_counts[ans] > self.n_samples // 2:
                     print(f"[SOLVER] early-stop: raw majority reached by answer={ans}")
                     break
-
-                # Early stop 2: weighted lead cannot be overtaken
-                remaining_samples = self.n_samples - (i + 1)
-                if weighted_scores and remaining_samples > 0:
-                    ranked = sorted(weighted_scores.items(), key=lambda x: x[1], reverse=True)
-                    best_ans, best_score = ranked[0]
-                    second_score = ranked[1][1] if len(ranked) > 1 else 0.0
-                    max_second_possible = second_score + remaining_samples * MAX_SINGLE_SAMPLE_WEIGHT
-                    if best_score > max_second_possible:
-                        print(
-                            "[SOLVER] early-stop: weighted winner locked "
-                            f"(best={best_ans}, score={best_score:.2f}, "
-                            f"max_second={max_second_possible:.2f})"
-                        )
-                        break
             except Exception as e:
                 print(f"[WARN] Sample {i} failed: {e}")
                 sample_results.append((None, 0.0))
